@@ -65,11 +65,31 @@ class MainApp(tk.Tk):
         self._selected_count_var = tk.StringVar(value="0 élément sélectionné")
         self._queue_count_var = tk.StringVar(value="File restante: 0 élément")
         self._summary_var = tk.StringVar(value="0 en ligne • 0 dans la file • 0 déjà présents")
+        self._status_var = tk.StringVar(value="Prêt")
+        self._destination_scan_after = None
+        self._destination_scan_generation = 0
+        self._destination_insert_after = None
+        self._destination_rows = []
+        self._destination_insert_index = 0
+        self._destination_insert_generation = 0
+        self._mark_after = None
+        self._mark_generation = 0
+        self._mark_running = False
+        self._queue_update_after = None
+        self._latest_queue_snapshot = None
+        self._last_queue_render_signature = None
+        self._session_save_after = None
+        self._session_write_lock = threading.Lock()
+        self._availability_update_after = None
+        self._latest_availability_update = None
+        self._source_tree_generation = 0
+        self._source_tree_rows = []
+        self._source_tree_insert_index = 0
+        self._source_tree_log_message = True
         self._dependencies_ready = True
         self._setup_widgets()
         self._refresh_playlist_history()
-        self.output_var.trace_add('write', lambda *_: self._refresh_destination_files())
-        self._refresh_destination_files()
+        self.output_var.trace_add('write', self._on_output_changed)
 
         self.downloader = Downloader(
             log_callback=self._threadsafe_log,
@@ -82,7 +102,7 @@ class MainApp(tk.Tk):
 
         self.after(100, self._startup_checks)
         self.after(200, self._load_previous_session)
-        self.after(500, self._refresh_queue_view)
+        self.after(0, self._schedule_destination_scan)
         self.after(30000, self._periodic_session_save)
         self.after(300, self.url_entry.focus_set)
 
@@ -145,16 +165,77 @@ class MainApp(tk.Tk):
         self._save_playlist_history()
         self._append_log(f"Entrée supprimée de l’historique : {removed.get('title') or removed.get('url')}")
 
+    def _set_status(self, message, busy=False):
+        self._status_var.set(message)
+        self.configure(cursor='watch' if busy else '')
+
+    def _on_output_changed(self, *_):
+        self._schedule_destination_scan()
+        self._schedule_loaded_file_mark()
+
+    def _on_format_changed(self, event=None):
+        self._schedule_loaded_file_mark()
+
+    def _schedule_loaded_file_mark(self):
+        if self._mark_after:
+            try:
+                self.after_cancel(self._mark_after)
+            except tk.TclError:
+                pass
+        self._mark_after = self.after(450, self._mark_loaded_files)
+
     def _on_existing_option_changed(self):
         if self.force_download_var.get():
             self.skip_existing_var.set(False)
-        self._mark_loaded_files()
-        self._populate_tree(log_message=False)
+        self._schedule_loaded_file_mark()
 
     def _mark_loaded_files(self):
+        self._mark_after = None
         if self.downloader and self.infos:
-            self.downloader.mark_existing(self.infos, self.output_var.get(), self.format_var.get(),
-                                          self.skip_existing_var.get())
+            self._start_mark_existing(self.infos, self.output_var.get(), self.format_var.get(),
+                                      self.skip_existing_var.get(), refresh_tree=True)
+
+    def _start_mark_existing(self, infos, output_dir, format_choice, skip_existing,
+                             refresh_tree=False, on_done=None):
+        self._mark_generation += 1
+        generation = self._mark_generation
+        self._mark_running = True
+        count = len(infos)
+        self._set_status(f"Analyse des fichiers déjà présents… ({count} titres)", busy=True)
+        self._append_log(f"Calcul des fichiers déjà présents ({count} titres)…")
+        self.add_queue_btn.configure(state='disabled')
+        self.load_info_btn.configure(state='disabled')
+        self.availability_btn.configure(state='disabled')
+
+        def worker():
+            try:
+                existing = self.downloader.mark_existing(
+                    infos, output_dir, format_choice, skip_existing)
+            except Exception as error:
+                self.after(0, lambda: self._finish_mark_existing(
+                    generation, 0, refresh_tree, on_done, error))
+                return
+            self.after(0, lambda: self._finish_mark_existing(
+                generation, existing, refresh_tree, on_done, None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_mark_existing(self, generation, existing, refresh_tree, on_done, error):
+        if generation != self._mark_generation:
+            return
+        self._mark_running = False
+        self._set_status("Prêt")
+        self.load_info_btn.configure(state='normal' if self._dependencies_ready else 'disabled')
+        self.availability_btn.configure(state='normal' if self._dependencies_ready else 'disabled')
+        self.add_queue_btn.configure(state='normal')
+        if error:
+            self._append_log(f"Échec du calcul des fichiers présents : {error}")
+            return
+        self._append_log(f"Analyse terminée : {existing} fichier(s) déjà présent(s).")
+        if refresh_tree:
+            self._populate_tree(log_message=False)
+        if on_done:
+            on_done()
 
     def _setup_widgets(self):
         pad = 6
@@ -166,6 +247,7 @@ class MainApp(tk.Tk):
         top_frame.pack(fill='x', padx=pad, pady=(pad, 0))
         ttk.Label(top_frame, text="YT Audio DLer", font=('TkDefaultFont', 15, 'bold')).pack(side='left')
         ttk.Label(top_frame, text="Téléchargement audio YouTube", foreground='#666666').pack(side='left', padx=(10, 0))
+        ttk.Label(top_frame, textvariable=self._status_var, foreground='#555555').pack(side='left', padx=(18, 0))
         environment_btn = ttk.Button(top_frame, text="Environnement", command=self.show_environment)
         environment_btn.pack(side='right')
         Tooltip(environment_btn, "Afficher l’état de yt-dlp et FFmpeg")
@@ -300,7 +382,7 @@ class MainApp(tk.Tk):
                           state='disabled')
         self.clear_queue_btn.pack(side='left', padx=(8, 0))
         ttk.Label(queue_controls, textvariable=self._queue_count_var).pack(side='left', padx=(12, 0))
-        save_session_btn = ttk.Button(queue_controls, text="Sauvegarder la session maintenant", command=self._save_session)
+        save_session_btn = ttk.Button(queue_controls, text="Sauvegarder la session maintenant", command=self._save_session_async)
         save_session_btn.pack(side='right')
         Tooltip(self.remove_queue_btn, "Supprimer les éléments sélectionnés de la file")
         Tooltip(self.move_up_btn, "Déplacer l’élément sélectionné vers le haut")
@@ -359,6 +441,7 @@ class MainApp(tk.Tk):
         fmt_combo = ttk.Combobox(opt_frame, textvariable=self.format_var, state='readonly',
                                  values=["Best (original)", "MP3 320kbps", "MP3 256kbps", "M4A", "FLAC", "OPUS"])
         fmt_combo.pack(side='left')
+        fmt_combo.bind('<<ComboboxSelected>>', self._on_format_changed)
 
         ttk.Checkbutton(opt_frame, text="Ignorer les fichiers déjà présents",
                 variable=self.skip_existing_var,
@@ -474,7 +557,18 @@ class MainApp(tk.Tk):
         self.after(0, self._worker_finished_ui)
 
     def _threadsafe_queue_update(self, snapshot):
-        self.after(0, lambda: self._update_queue_view(snapshot))
+        self._latest_queue_snapshot = snapshot
+        if self._queue_update_after is None:
+            try:
+                self._queue_update_after = self.after(100, self._flush_queue_update)
+            except tk.TclError:
+                pass
+
+    def _flush_queue_update(self):
+        self._queue_update_after = None
+        snapshot = self._latest_queue_snapshot
+        if snapshot is not None:
+            self._update_queue_view(snapshot)
 
     def _format_wait(self, seconds):
         seconds = int(max(0, seconds))
@@ -484,6 +578,12 @@ class MainApp(tk.Tk):
         return f"{minutes}m {remaining:02d}s"
 
     def _update_queue_view(self, snapshot):
+        signature = tuple((item['id'], item['status'], item.get('position', ''),
+                           item['info'].get('_availability', 'unknown'),
+                           int(item.get('wait_seconds', 0))) for item in snapshot)
+        if signature == self._last_queue_render_signature:
+            return
+        self._last_queue_render_signature = signature
         selected = set(self.queue_tree.selection())
         for item_id in self.queue_tree.get_children():
             self.queue_tree.delete(item_id)
@@ -514,7 +614,7 @@ class MainApp(tk.Tk):
         self._refresh_summary(snapshot)
         if not pending:
             self.queue_estimate_var.set("File d’attente vide.")
-        self._update_queue_button_states()
+        self._update_queue_button_states(snapshot=snapshot)
 
     def _refresh_summary(self, snapshot=None):
         if snapshot is None:
@@ -546,10 +646,11 @@ class MainApp(tk.Tk):
         if url:
             webbrowser.open(url)
 
-    def _update_queue_button_states(self, event=None):
+    def _update_queue_button_states(self, event=None, snapshot=None):
         if not hasattr(self, 'queue_tree'):
             return
-        snapshot = self.downloader.get_queue_snapshot() if self.downloader else []
+        if snapshot is None:
+            snapshot = self.downloader.get_queue_snapshot() if self.downloader else []
         queueable_statuses = {'Pending', 'Déjà présent'}
         pending = {item['id']: item for item in snapshot if item['status'] in queueable_statuses}
         selected = [int(item_id) for item_id in self.queue_tree.selection()]
@@ -609,11 +710,16 @@ class MainApp(tk.Tk):
             messagebox.showerror("Dossier invalide", f"Impossible de créer le dossier de sortie : {error}")
             return
         fmt = self.format_var.get()
-        self.downloader.mark_existing(available_infos, output_dir, fmt, self.skip_existing_var.get())
-        self.downloader.enqueue(available_infos, output_dir, fmt, self.skip_existing_var.get())
-        self._session_restored = False
-        self._populate_tree(log_message=False)
-        self._append_log(f"{len(available_infos)} élément(s) ajouté(s) à la file d’attente.")
+        skip_existing = self.skip_existing_var.get()
+
+        def enqueue_marked_items():
+            self.downloader.enqueue(available_infos, output_dir, fmt, skip_existing)
+            self._session_restored = False
+            self._populate_tree(log_message=False)
+            self._append_log(f"{len(available_infos)} élément(s) ajouté(s) à la file d’attente.")
+
+        self._start_mark_existing(available_infos, output_dir, fmt, skip_existing,
+                                  refresh_tree=False, on_done=enqueue_marked_items)
 
     def _get_custom_settings(self):
         try:
@@ -639,12 +745,18 @@ class MainApp(tk.Tk):
             pass
 
     def _threadsafe_session_save(self):
+        if self._session_save_after is not None:
+            return
         try:
-            self.after(0, self._save_session)
+            self._session_save_after = self.after(500, self._save_session_async)
         except tk.TclError:
             pass
 
-    def _save_session(self):
+    def _save_session_async(self):
+        self._session_save_after = None
+        self._save_session(asynchronous=True)
+
+    def _save_session(self, asynchronous=False):
         if not self.downloader:
             return False
         state = self.downloader.get_session_state(
@@ -662,25 +774,33 @@ class MainApp(tk.Tk):
         state['geometry'] = self.geometry()
         state['skip_existing'] = self.skip_existing_var.get()
         state['force_download'] = self.force_download_var.get()
-        temporary_path = self._session_path + ".tmp"
-        try:
-            with open(temporary_path, 'w', encoding='utf-8') as session_file:
-                json.dump(state, session_file, ensure_ascii=False, indent=2)
-            os.replace(temporary_path, self._session_path)
-            self._append_log("Session saved.")
+        if asynchronous:
+            threading.Thread(target=self._write_session_state, args=(state,), daemon=True).start()
             return True
-        except (OSError, TypeError, ValueError) as error:
-            self._append_log(f"Session save failed: {error}")
+        return self._write_session_state(state)
+
+    def _write_session_state(self, state):
+        temporary_path = self._session_path + ".tmp"
+        logger = self._threadsafe_log if threading.current_thread() is not threading.main_thread() else self._append_log
+        with self._session_write_lock:
             try:
-                if os.path.exists(temporary_path):
-                    os.remove(temporary_path)
-            except OSError:
-                pass
-            return False
+                with open(temporary_path, 'w', encoding='utf-8') as session_file:
+                    json.dump(state, session_file, ensure_ascii=False, indent=2)
+                os.replace(temporary_path, self._session_path)
+                logger("Session saved.")
+                return True
+            except (OSError, TypeError, ValueError) as error:
+                logger(f"Session save failed: {error}")
+                try:
+                    if os.path.exists(temporary_path):
+                        os.remove(temporary_path)
+                except OSError:
+                    pass
+                return False
 
     def _periodic_session_save(self):
         if self.downloader and self.downloader.worker_thread and self.downloader.worker_thread.is_alive():
-            self._save_session()
+            self._save_session(asynchronous=True)
         try:
             self.after(30000, self._periodic_session_save)
         except tk.TclError:
@@ -689,6 +809,10 @@ class MainApp(tk.Tk):
     def _load_previous_session(self):
         if not os.path.isfile(self._session_path):
             return
+        self._set_status("Chargement de la session précédente…", busy=True)
+        threading.Thread(target=self._load_previous_session_thread, daemon=True).start()
+
+    def _load_previous_session_thread(self):
         try:
             with open(self._session_path, 'r', encoding='utf-8') as session_file:
                 state = json.load(session_file)
@@ -697,9 +821,12 @@ class MainApp(tk.Tk):
                     not isinstance(state.get('completed'), list)):
                 raise ValueError("unsupported session format")
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
-            self._append_log(f"Session load failed: {error}")
+            self._threadsafe_log(f"Session load failed: {error}")
+            self.after(0, lambda: self._set_status("Prêt"))
             return
+        self.after(0, lambda: self._restore_previous_session(state))
 
+    def _restore_previous_session(self, state):
         saved_at = state.get('saved_at', 'date inconnue')
         resume = messagebox.askyesno(
             "Session précédente",
@@ -707,6 +834,7 @@ class MainApp(tk.Tk):
         )
         if not resume:
             self._archive_session()
+            self._set_status("Prêt")
             return
 
         self.output_var.set(state.get('output_dir') or self.output_var.get())
@@ -735,12 +863,14 @@ class MainApp(tk.Tk):
             self.downloader.restore_session(state['queue'], state['completed'])
         except (TypeError, ValueError, KeyError) as error:
             self._append_log(f"Session restore failed: {error}")
+            self._set_status("Prêt")
             return
         self.infos = [item['info'] for item in state['queue']]
         self._mark_loaded_files()
         self._session_restored = True
         self._populate_tree()
         self._append_log("Previous session resumed.")
+        self._set_status("Prêt")
 
     def _archive_session(self):
         archive_path = self._session_path + ".dismissed-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -791,6 +921,7 @@ class MainApp(tk.Tk):
             messagebox.showinfo("No URL", "Please enter a YouTube video or playlist URL.")
             return
         self._append_log(f"Loading info for: {url}")
+        self._set_status("Chargement des informations…", busy=True)
         self.start_btn.configure(state='disabled')
         output_dir = self.output_var.get()
         format_choice = self.format_var.get()
@@ -806,15 +937,20 @@ class MainApp(tk.Tk):
             self._threadsafe_log(f"Failed to load info: {e}")
             self.infos = []
             self.after(0, self._populate_tree)
-            self.after(0, lambda: self.start_btn.configure(state='normal'))
+            self.after(0, lambda: (self.start_btn.configure(state='normal'), self._set_status("Prêt")))
             return
+        self.after(0, lambda: self._set_status(
+            f"Analyse des fichiers déjà présents… ({len(infos)} titres)", busy=True))
+        self._threadsafe_log(f"Calcul des fichiers déjà présents ({len(infos)} titres)…")
         self.downloader.mark_existing(infos, output_dir, format_choice, skip_existing)
         self.infos = infos
         self.after(0, self._populate_tree)
         self.after(0, lambda: self._record_playlist_history(url, infos))
-        self.after(0, lambda: self.start_btn.configure(state='normal'))
+        self.after(0, lambda: (self.start_btn.configure(state='normal'), self._set_status("Prêt")))
 
     def _populate_tree(self, log_message=True):
+        self._source_tree_generation += 1
+        generation = self._source_tree_generation
         loaded_count = len(self.infos)
         present_count = sum(1 for info in self.infos if info.get('_already_present'))
         pending_count = loaded_count - present_count
@@ -827,6 +963,7 @@ class MainApp(tk.Tk):
         if not self.infos:
             self._append_log("No items found.")
             return
+        rows = []
         for idx, info in enumerate(self.infos):
             if self.hide_unavailable and info.get('_availability') not in (None, 'ok', 'unknown'):
                 continue
@@ -836,10 +973,27 @@ class MainApp(tk.Tk):
             display_index = info.get('playlist_index') or idx + 1
             availability = info.get('_availability', 'unknown')
             tag = 'already_present' if info.get('_already_present') else self._availability_tag(availability)
+            rows.append((idx, display_index, title, duration, uploader, availability, tag))
+        self._source_tree_rows = rows
+        self._source_tree_insert_index = 0
+        self._source_tree_log_message = log_message
+        self._insert_source_tree_batch(generation)
+
+    def _insert_source_tree_batch(self, generation):
+        if generation != self._source_tree_generation:
+            return
+        start = self._source_tree_insert_index
+        end = min(start + 200, len(self._source_tree_rows))
+        for row in self._source_tree_rows[start:end]:
+            idx, display_index, title, duration, uploader, availability, tag = row
             self.tree.insert("", "end", iid=str(idx),
                              values=(display_index, title, duration, uploader, availability), tags=(tag,))
-        if log_message:
-            self._append_log(f"Loaded {len(self.infos)} items. Select items to download (Ctrl+click for multiple).")
+        self._source_tree_insert_index = end
+        if end < len(self._source_tree_rows):
+            self.after(10, lambda: self._insert_source_tree_batch(generation))
+        elif self._source_tree_log_message:
+            self._append_log(
+                f"Loaded {len(self.infos)} items. Select items to download (Ctrl+click for multiple).")
 
     @staticmethod
     def _availability_tag(status):
@@ -875,6 +1029,8 @@ class MainApp(tk.Tk):
         self.availability_progress.pack(fill='x', padx=6, pady=(0, 2))
         self.start_btn.configure(state='disabled')
         self.filter_button.configure(state='disabled')
+        self._set_status(f"Vérification de disponibilité… (0/{len(items)})", busy=True)
+        self._append_log(f"Vérification de disponibilité ({len(items)} titres)…")
         threading.Thread(target=self._verify_availability_thread, args=(items,), daemon=True).start()
 
     def _verify_availability_thread(self, items):
@@ -893,10 +1049,19 @@ class MainApp(tk.Tk):
             pass
 
     def _threadsafe_availability_progress(self, current, total, status, info):
+        self._latest_availability_update = (current, total, status)
+        if self._availability_update_after is not None:
+            return
         try:
-            self.after(0, lambda: self._update_availability_progress(current, total, status))
+            self._availability_update_after = self.after(150, self._flush_availability_progress)
         except tk.TclError:
             pass
+
+    def _flush_availability_progress(self):
+        self._availability_update_after = None
+        update = self._latest_availability_update
+        if update:
+            self._update_availability_progress(*update)
 
     def _update_availability_progress(self, current, total, status):
         self.availability_progress.configure(value=current)
@@ -908,10 +1073,12 @@ class MainApp(tk.Tk):
         self.filter_button.configure(state='normal')
         if counts is None:
             self.availability_progress_var.set("Vérification interrompue.")
+            self._set_status("Prêt")
             return
         summary = " • ".join(f"{count} {status}" for status, count in sorted(counts.items()))
         self.availability_progress_var.set(f"Vérification terminée: {summary}")
         self._append_log(f"Availability summary: {summary}")
+        self._set_status("Prêt")
 
     def browse_output(self):
         folder = filedialog.askdirectory(initialdir=self.output_var.get() or os.path.expanduser("~"))
@@ -943,31 +1110,90 @@ class MainApp(tk.Tk):
             value /= 1024
 
     def _refresh_destination_files(self):
+        self._schedule_destination_scan()
+
+    def _schedule_destination_scan(self):
         if not hasattr(self, 'destination_tree'):
+            return
+        if self._destination_scan_after:
+            try:
+                self.after_cancel(self._destination_scan_after)
+            except tk.TclError:
+                pass
+        self._destination_scan_generation += 1
+        generation = self._destination_scan_generation
+        self._destination_scan_after = self.after(450, lambda: self._start_destination_scan(generation))
+
+    def _start_destination_scan(self, generation):
+        self._destination_scan_after = None
+        folder = self.output_var.get().strip()
+        self._set_status("Scan du dossier de destination…", busy=True)
+        self._append_log(f"Scan du dossier de destination : {folder or '(vide)'}…")
+
+        def worker():
+            rows = []
+            error = None
+            audio_extensions = {'.mp3', '.m4a', '.flac', '.opus', '.wav', '.aac', '.webm', '.ogg'}
+            try:
+                if os.path.isdir(folder):
+                    for entry in os.scandir(folder):
+                        if not entry.is_file() or os.path.splitext(entry.name)[1].lower() not in audio_extensions:
+                            continue
+                        try:
+                            stat = entry.stat()
+                            modified = datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%d/%m/%Y %H:%M')
+                            size = self._format_file_size(stat.st_size)
+                        except OSError:
+                            modified, size = '--', '--'
+                        rows.append((entry.name, size, modified))
+                rows.sort(key=lambda row: row[0].lower())
+            except OSError as scan_error:
+                error = scan_error
+            try:
+                self.after(0, lambda: self._apply_destination_scan(generation, folder, rows, error))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_destination_scan(self, generation, folder, rows, error):
+        if generation != self._destination_scan_generation or folder != self.output_var.get().strip():
             return
         for item_id in self.destination_tree.get_children():
             self.destination_tree.delete(item_id)
-        folder = self.output_var.get().strip()
-        audio_extensions = {'.mp3', '.m4a', '.flac', '.opus', '.wav', '.aac', '.webm', '.ogg'}
-        files = []
-        try:
-            if os.path.isdir(folder):
-                files = [entry for entry in os.scandir(folder)
-                         if entry.is_file() and os.path.splitext(entry.name)[1].lower() in audio_extensions]
-        except OSError as error:
+        self._destination_rows = rows
+        self._destination_insert_index = 0
+        self._destination_insert_generation = generation
+        self._insert_destination_batch(generation)
+        if error:
             self._append_log(f"Impossible de scanner le dossier de destination : {error}")
-        files.sort(key=lambda entry: entry.name.lower())
-        for index, entry in enumerate(files):
-            try:
-                modified = datetime.datetime.fromtimestamp(entry.stat().st_mtime).strftime('%d/%m/%Y %H:%M')
-                size = self._format_file_size(entry.stat().st_size)
-            except OSError:
-                modified, size = '--', '--'
+        else:
+            self._append_log(f"Scan terminé : {len(rows)} fichier(s) audio.")
+        if not self._mark_running:
+            self._set_status("Prêt")
+
+    def _insert_destination_batch(self, generation=None):
+        if generation is not None and generation != self._destination_insert_generation:
+            return
+        start = self._destination_insert_index
+        end = min(start + 200, len(self._destination_rows))
+        for index in range(start, end):
+            name, size, modified = self._destination_rows[index]
             self.destination_tree.insert('', 'end', iid=str(index),
-                                        values=(entry.name, size, modified),
-                                        tags=('already_present',))
-        self.destination_count_var.set(f"{len(files)} fichier" + ('s' if len(files) != 1 else '') + " présent" + ('s' if len(files) != 1 else ''))
+                                         values=(name, size, modified), tags=('already_present',))
+        self._destination_insert_index = end
+        self.destination_count_var.set(
+            f"{len(self._destination_rows)} fichier" +
+            ('s' if len(self._destination_rows) != 1 else '') + " présent" +
+            ('s' if len(self._destination_rows) != 1 else ''))
         self._refresh_summary()
+        if end < len(self._destination_rows):
+            self._destination_insert_after = self.after(
+                10, lambda: self._insert_destination_batch(self._destination_insert_generation))
+
+    def _legacy_refresh_destination_files(self):
+        """Compatibility wrapper retained for older callbacks."""
+        self._schedule_destination_scan()
 
     def _open_audio_file(self, path):
         if not os.path.isfile(path):
@@ -1072,7 +1298,17 @@ class MainApp(tk.Tk):
             self.stop_btn.configure(state='disabled')
 
     def _startup_checks(self):
+        self._set_status("Vérification de l’environnement…", busy=True)
+        threading.Thread(target=self._startup_checks_thread, daemon=True).start()
+
+    def _startup_checks_thread(self):
         diagnostics = get_environment_diagnostics()
+        try:
+            self.after(0, lambda: self._apply_startup_checks(diagnostics))
+        except tk.TclError:
+            pass
+
+    def _apply_startup_checks(self, diagnostics):
         self._last_environment_diagnostics = diagnostics
         ytdlp = diagnostics['yt-dlp']
         self._dependencies_ready = ytdlp['import_available'] and ytdlp['status_detail'] != 'Version trop ancienne'
@@ -1083,6 +1319,7 @@ class MainApp(tk.Tk):
             self._append_log(f"yt-dlp: {ytdlp['status_detail']}")
         if diagnostics['ffmpeg']['status'] != 'OK':
             self._append_log("Attention: FFmpeg est absent ou introuvable dans le PATH.")
+        self._set_status("Prêt")
 
     def _set_dependency_controls(self, ytdlp):
         if ytdlp['status'] == 'OK':
@@ -1170,7 +1407,18 @@ class MainApp(tk.Tk):
     def _refresh_environment(self):
         if not getattr(self, '_environment_dialog', None) or not self._environment_dialog.winfo_exists():
             return
+        self._environment_help_var.set("Détection en cours…")
+        self._set_status("Vérification de l’environnement…", busy=True)
+        threading.Thread(target=self._refresh_environment_thread, daemon=True).start()
+
+    def _refresh_environment_thread(self):
         diagnostics = get_environment_diagnostics()
+        try:
+            self.after(0, lambda: self._apply_environment_diagnostics(diagnostics))
+        except tk.TclError:
+            pass
+
+    def _apply_environment_diagnostics(self, diagnostics):
         self._last_environment_diagnostics = diagnostics
         ytdlp = diagnostics['yt-dlp']
         self._dependencies_ready = ytdlp['import_available'] and ytdlp['status_detail'] != 'Version trop ancienne'
@@ -1202,6 +1450,7 @@ class MainApp(tk.Tk):
         self._set_dependency_controls(ytdlp)
         if diagnostics['yt-dlp']['status'] != 'OK' or diagnostics['ffmpeg']['status'] != 'OK':
             self._append_log("Dependency warning: yt-dlp or FFmpeg requires attention.")
+        self._set_status("Prêt")
 
     def _copy_ytdlp_command(self):
         self.clipboard_clear()
@@ -1222,7 +1471,10 @@ class MainApp(tk.Tk):
             pass
 
     def _copy_environment_info(self):
-        diagnostics = getattr(self, '_last_environment_diagnostics', get_environment_diagnostics(include_latest=False))
+        diagnostics = getattr(self, '_last_environment_diagnostics', None)
+        if not diagnostics:
+            self._append_log("Diagnostic d’environnement encore en cours.")
+            return
         lines = [f"OS: {diagnostics['os']}"]
         for tool in ('yt-dlp', 'ffmpeg'):
             data = diagnostics[tool]
