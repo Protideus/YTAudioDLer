@@ -58,7 +58,7 @@ class Downloader:
             value = sanitize_filename(str(value or 'unknown'), restricted=False)
         except (ImportError, TypeError, ValueError):
             value = str(value or 'unknown')
-        return value.replace('/', '_').replace('\\', '_').strip() or 'unknown'
+        return value.replace('/', '_').replace('\\', '_') or 'unknown'
 
     @staticmethod
     def _format_extension(format_choice, source_extension):
