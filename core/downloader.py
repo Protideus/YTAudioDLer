@@ -48,6 +48,17 @@ class Downloader:
         # FIXED: throttle logging state for progress hook to avoid flooding the GUI log
         self._last_log_time = 0.0
         self._last_logged_percent = -1
+        self._estimate_cache_key = None
+        self._estimate_cache = ()
+
+    @staticmethod
+    def _safe_filename(value):
+        try:
+            from yt_dlp.utils import sanitize_filename
+            value = sanitize_filename(str(value or 'unknown'), restricted=False)
+        except (ImportError, TypeError, ValueError):
+            value = str(value or 'unknown')
+        return value.replace('/', '_').replace('\\', '_').strip() or 'unknown'
 
     @staticmethod
     def _format_extension(format_choice, source_extension):
@@ -148,27 +159,42 @@ class Downloader:
         return 'error'
 
     def get_expected_filepath(self, info, output_dir, format_choice):
-        """Resolve the final output path using the same template as yt-dlp."""
-        try:
-            import yt_dlp as ytdl_module
-            with ytdl_module.YoutubeDL(self._make_ydl_opts(output_dir, format_choice)) as ydl:
-                filename = ydl.prepare_filename(info)
-        except Exception:
-            title = info.get('title', 'unknown')
-            filename = os.path.join(output_dir, f"{title}.{info.get('ext', 'webm')}")
-        root, source_extension = os.path.splitext(filename)
-        extension = self._format_extension(format_choice, source_extension.lstrip('.'))
-        return f"{root}.{extension}"
+        """Resolve the output path without constructing a YoutubeDL instance."""
+        output_dir = os.path.abspath(os.path.expanduser(output_dir))
+        title = self._safe_filename(info.get('title', 'unknown'))
+        video_id = self._safe_filename(info.get('id', ''))
+        source_extension = str(info.get('ext') or 'webm').lstrip('.')
+        extension = self._format_extension(format_choice, source_extension)
+        filename = f"{title} [{video_id}].{extension}" if video_id else f"{title}.{extension}"
+        return os.path.join(output_dir, filename)
 
-    def mark_existing(self, info_list, output_dir, format_choice, skip_existing=True):
+    def mark_existing(self, info_list, output_dir, format_choice, skip_existing=True,
+                      progress_callback=None):
         """Annotate entries with their expected path and already-present status."""
+        output_dir = os.path.abspath(os.path.expanduser(output_dir))
+        existing_names = set()
+        try:
+            if os.path.isdir(output_dir):
+                existing_names = {
+                    entry.name for entry in os.scandir(output_dir) if entry.is_file()
+                }
+        except OSError:
+            existing_names = set()
         existing = 0
-        for info in info_list:
-            path = self.get_expected_filepath(info, output_dir, format_choice)
+        total = len(info_list)
+        for index, info in enumerate(info_list, start=1):
+            path = info.get('_expected_filepath')
+            path_context = info.get('_expected_filepath_context')
+            context = (output_dir, format_choice, info.get('title'), info.get('id'), info.get('ext'))
+            if not path or path_context != context:
+                path = self.get_expected_filepath(info, output_dir, format_choice)
             info['_expected_filepath'] = path
-            info['_already_present'] = bool(skip_existing and os.path.isfile(path))
+            info['_expected_filepath_context'] = context
+            info['_already_present'] = bool(skip_existing and os.path.basename(path) in existing_names)
             if info['_already_present']:
                 existing += 1
+            if progress_callback:
+                progress_callback(index, total, info)
         return existing
 
     def enqueue(self, info_list, output_dir=None, format_choice=None, skip_existing=False):
@@ -303,13 +329,24 @@ class Downloader:
                 items.append(current)
 
             pending_wait = max(0, self._waiting_until - now) if self._waiting_until else 0
-            for position, item in enumerate(self.task_queue, start=1):
+            estimate_key = (
+                self._speed_mode,
+                tuple(sorted(self._custom_settings.items())),
+                tuple((item['id'], item['info'].get('duration') or 0) for item in self.task_queue),
+            )
+            if estimate_key != self._estimate_cache_key:
+                self._estimate_cache = tuple(
+                    self.estimate_delay(item['info'].get('duration') or 0,
+                                        self._speed_mode, self._custom_settings)
+                    for item in self.task_queue
+                )
+                self._estimate_cache_key = estimate_key
+            for position, (item, delay) in enumerate(zip(self.task_queue, self._estimate_cache), start=1):
                 pending = dict(item)
                 pending['position'] = position
                 pending['wait_seconds'] = pending_wait
                 items.append(pending)
-                duration = item['info'].get('duration') or 0
-                pending_wait += self.estimate_delay(duration, self._speed_mode, self._custom_settings)
+                pending_wait += delay
 
             items.extend(dict(item, position='', wait_seconds=0) for item in self._completed_items)
             return items
@@ -528,7 +565,8 @@ class Downloader:
             self._notify_queue_update()
             info = item['info']
             self.overall_progress(completed, total)
-            expected_path = self.get_expected_filepath(info, output_dir, format_choice)
+            expected_path = info.get('_expected_filepath') or self.get_expected_filepath(
+                info, output_dir, format_choice)
             info['_expected_filepath'] = expected_path
             if skip_existing and not force_download and os.path.isfile(expected_path):
                 self.log_msg(f"Déjà présent, téléchargement ignoré : {info.get('title', 'inconnu')}")
